@@ -1,10 +1,10 @@
 use crate::error::{br, br_zero_is_success, BoringResult};
-use boring::error::ErrorStack;
-use boring::pkey::{HasPrivate, PKey};
-use boring::ssl::{Ssl, SslContext, SslContextRef, SslSession};
-use boring::x509::store::X509StoreBuilderRef;
-use boring::x509::X509;
-use boring_sys as bffi;
+use btls::error::ErrorStack;
+use btls::pkey::{HasPrivate, PKey};
+use btls::ssl::{Ssl, SslContext, SslContextRef, SslSession};
+use btls::x509::store::X509StoreBuilderRef;
+use btls::x509::X509;
+use btls_sys as bffi;
 use bytes::{Buf, BufMut};
 use foreign_types_shared::{ForeignType, ForeignTypeRef};
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
@@ -272,6 +272,7 @@ pub trait QuicSsl {
 
     fn in_early_data(&self) -> bool;
     fn early_data_accepted(&self) -> bool;
+    fn set_early_data_enabled(&mut self, enabled: bool);
     fn set_quic_method(&mut self, method: &bffi::SSL_QUIC_METHOD) -> BoringResult;
     fn set_quic_early_data_context(&mut self, value: &[u8]) -> BoringResult;
     fn get_early_data_reason(&self) -> bffi::ssl_early_data_reason_t;
@@ -371,7 +372,7 @@ impl QuicSsl for Ssl {
 
     fn set_verify_hostname(&mut self, domain: &str) -> BoringResult {
         let param = self.param_mut();
-        param.set_hostflags(boring::x509::verify::X509CheckFlags::NO_PARTIAL_WILDCARDS);
+        param.set_hostflags(btls::x509::verify::X509CheckFlags::NO_PARTIAL_WILDCARDS);
         match domain.parse() {
             Ok(ip) => param.set_ip(ip)?,
             Err(_) => param.set_host(domain)?,
@@ -408,6 +409,11 @@ impl QuicSsl for Ssl {
     #[inline]
     fn early_data_accepted(&self) -> bool {
         unsafe { bffi::SSL_early_data_accepted(self.as_ptr()) == 1 }
+    }
+
+    #[inline]
+    fn set_early_data_enabled(&mut self, enabled: bool) {
+        unsafe { bffi::SSL_set_early_data_enabled(self.as_ptr(), enabled as c_int) }
     }
 
     fn set_quic_method(&mut self, method: &bffi::SSL_QUIC_METHOD) -> BoringResult {

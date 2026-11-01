@@ -1,9 +1,9 @@
 [package]
-name = "quinn-boring"
+name = "quinn-btls"
 version = "0.2.0"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/quinn-rs/quinn-boring"
-description = "BoringSSL crypto provider for quinn"
+description = "BoringSSL (btls) crypto provider for quinn"
 keywords = ["quic"]
 categories = ["network-programming", "asynchronous"]
 edition = "2021"
@@ -14,12 +14,12 @@ maintenance = { status = "passively-maintained" }
 
 [features]
 default = ["runtime-tokio"]
-fips = ["boring/fips", "boring-sys/fips"]
+fips = ["btls/fips", "btls-sys/fips"]
 runtime-tokio = ["quinn/runtime-tokio"]
 
 [dependencies]
-boring = "4"
-boring-sys = "4"
+btls = "0.5.6"
+btls-sys = "0.5.6"
 bytes = "1"
 foreign-types-shared = "0.3"
 lru = "0.12"
@@ -48,3 +48,14 @@ required-features = ["runtime-tokio"]
 [[example]]
 name = "client"
 required-features = ["runtime-tokio"]
+
+# The btls fork whose mirrored ClientHello can offer values BoringSSL does not negotiate,
+# failing a handshake whose server selects one with `SSL_R_OFFER_ONLY_VALUE_SELECTED`.
+[patch.crates-io]
+btls = { git = "https://github.com/Small-Marvel-Labs/btls", rev = "b274f23f8a99b59e20e8e1041c9a3509680a03ce" }
+btls-sys = { git = "https://github.com/Small-Marvel-Labs/btls", rev = "b274f23f8a99b59e20e8e1041c9a3509680a03ce" }
+# The quinn fork whose client sessions follow a server's compatible version negotiation
+# (`crypto::Session::switch_version`, RFC 9368).
+quinn = { git = "https://github.com/Small-Marvel-Labs/quinn", rev = "712d2cef4592093b856fe92d2241a6bb542a2630" }
+quinn-proto = { git = "https://github.com/Small-Marvel-Labs/quinn", rev = "712d2cef4592093b856fe92d2241a6bb542a2630" }
+quinn-udp = { git = "https://github.com/Small-Marvel-Labs/quinn", rev = "712d2cef4592093b856fe92d2241a6bb542a2630" }

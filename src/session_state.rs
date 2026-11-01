@@ -5,9 +5,9 @@ use crate::suite::CipherSuite;
 use crate::{
     retry, Error, HandshakeData, KeyLog, KeyLogLabel, Level, QuicSsl, QuicVersion, SslError,
 };
-use boring::error::ErrorStack;
-use boring::ssl::{NameType, Ssl};
-use boring_sys as bffi;
+use btls::error::ErrorStack;
+use btls::ssl::{NameType, Ssl};
+use btls_sys as bffi;
 use bytes::{Buf, BytesMut};
 use foreign_types_shared::ForeignType;
 use once_cell::sync::Lazy;
@@ -19,7 +19,7 @@ use std::ffi::{c_char, c_int, CStr};
 use std::io::Cursor;
 use std::result::Result as StdResult;
 use std::slice;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{error, trace, warn};
 
 pub(crate) static QUIC_METHOD: bffi::SSL_QUIC_METHOD = bffi::SSL_QUIC_METHOD {
@@ -50,6 +50,12 @@ pub(crate) struct SessionState {
     write_level: Level,
     levels: [LevelState; Level::NUM_LEVELS],
     handshaking: bool,
+    /// The handshake bytes a client wrote at the Initial level: its ClientHello, and another
+    /// after a HelloRetryRequest
+    initial_written: Vec<u8>,
+    /// Where a client records what the server selected that its ClientHello only offered,
+    /// when that failed the handshake (see [`crate::MirrorConfig::offer_only_selection`]).
+    pub(crate) offer_only: Option<Arc<OnceLock<String>>>,
 }
 
 impl SessionState {
@@ -79,6 +85,8 @@ impl SessionState {
             levels,
             early_data_rejected: false,
             handshaking: true,
+            initial_written: Vec::new(),
+            offer_only: None,
         });
 
         // Registers this instance as ex data on the underlying Ssl in order to support
@@ -121,15 +129,33 @@ impl SessionState {
         };
 
         let alpn_protocol = self.ssl.selected_alpn_protocol().map(Vec::from);
+        let client_hello = self.client_hello();
 
-        if sni_name.is_none() && alpn_protocol.is_none() {
+        if sni_name.is_none() && alpn_protocol.is_none() && client_hello.is_none() {
             None
         } else {
             Some(Box::new(HandshakeData {
                 protocol: alpn_protocol,
                 server_name: sni_name,
+                client_hello,
+                cipher: self
+                    .ssl
+                    .current_cipher()
+                    .and_then(|cipher| cipher.standard_name()),
+                group: self.ssl.curve(),
+                hello_retry_request: self.ssl.used_hello_retry_request(),
+                resumed: self.ssl.session_reused(),
+                peer_transport_parameters: self.ssl.get_peer_quic_transport_params().map(Vec::from),
             }))
         }
+    }
+
+    /// The first handshake message a client wrote, once complete: its ClientHello.
+    fn client_hello(&self) -> Option<Vec<u8>> {
+        let header = self.initial_written.get(..4)?;
+        let len = 4
+            + (usize::from(header[1]) << 16 | usize::from(header[2]) << 8 | usize::from(header[3]));
+        self.initial_written.get(..len).map(<[u8]>::to_vec)
     }
 
     #[inline]
@@ -224,6 +250,23 @@ impl SessionState {
         out.map(|keys| keys.as_crypto().unwrap())
     }
 
+    /// Switches a client to `version`, which the server negotiated in place of the one it
+    /// started with, before it derived handshake keys: its Initial, Handshake and 1-RTT keys are
+    /// then `version`'s, while its 0-RTT keys stay the original version's (RFC 9369 §4.1)
+    pub(crate) fn switch_version(
+        &mut self,
+        version: QuicVersion,
+    ) -> StdResult<(), crypto::UnsupportedVersion> {
+        if self.read_level != Level::Initial || self.write_level != Level::Initial {
+            return Err(crypto::UnsupportedVersion);
+        }
+        self.version = version;
+        for level in [Level::Handshake, Level::Application] {
+            self.level_state_mut(level).builder.version = version;
+        }
+        Ok(())
+    }
+
     #[inline]
     pub(crate) fn is_valid_retry(
         &self,
@@ -234,9 +277,18 @@ impl SessionState {
         retry::is_valid_retry(&self.version, orig_dst_cid, header, payload)
     }
 
+    /// The peer's certificate chain as a `Vec<Vec<u8>>` of DER certificates, leaf first.
     #[inline]
     pub(crate) fn peer_identity(&self) -> Option<Box<dyn Any>> {
-        todo!()
+        let mut chain = Vec::new();
+        // A server's peer chain lacks the client's leaf; a client's includes the server's.
+        if self.side.is_server() {
+            chain.push(self.ssl.peer_certificate()?.to_der().ok()?);
+        }
+        for cert in self.ssl.peer_cert_chain().into_iter().flatten() {
+            chain.push(cert.to_der().ok()?);
+        }
+        (!chain.is_empty()).then(|| Box::new(chain) as Box<dyn Any>)
     }
 
     #[inline]
@@ -288,6 +340,9 @@ impl SessionState {
             // Update the state of the handshake.
             self.handshaking = self.ssl.is_handshaking();
 
+            if rc.value() == bffi::SSL_ERROR_SSL {
+                self.record_offer_only();
+            }
             self.check_alert()?;
             self.check_ssl_error(rc)?;
         }
@@ -298,6 +353,24 @@ impl SessionState {
             return self.check_ssl_error(ssl_err);
         }
         Ok(())
+    }
+
+    /// Records in [`Self::offer_only`] the selection of an offer-only value that failed the
+    /// handshake (`SSL_R_OFFER_ONLY_VALUE_SELECTED`, its data naming the selection), if one
+    /// did, leaving the error queue as it was.
+    fn record_offer_only(&self) {
+        let Some(slot) = &self.offer_only else {
+            return;
+        };
+        let errors = ErrorStack::get();
+        let selection = errors.errors().iter().find_map(|error| {
+            (error.library_reason(bffi::ERR_LIB_SSL)? == bffi::SSL_R_OFFER_ONLY_VALUE_SELECTED)
+                .then(|| error.data().unwrap_or_default().to_owned())
+        });
+        if let Some(selection) = selection {
+            let _ = slot.set(selection);
+        }
+        errors.put();
     }
 
     #[inline]
@@ -413,6 +486,9 @@ impl SessionState {
 
         // Add the message to the level.
         state.write_buffer.extend_from_slice(data);
+        if self.side.is_client() && level == Level::Initial {
+            self.initial_written.extend_from_slice(data);
+        }
         Ok(())
     }
 

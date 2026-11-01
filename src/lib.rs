@@ -20,7 +20,7 @@ mod version;
 
 // Export the public interface.
 pub use bffi_ext::*;
-pub use client::Config as ClientConfig;
+pub use client::{Config as ClientConfig, MirrorConfig};
 pub use error::{Error, Result};
 pub use handshake_token::HandshakeTokenKey;
 pub use hmac::HmacKey;
@@ -41,6 +41,26 @@ pub struct HandshakeData {
     ///
     /// Always `None` for outgoing connections
     pub server_name: Option<String>,
+
+    /// The first ClientHello handshake message the client sent
+    ///
+    /// Always `None` for incoming connections
+    pub client_hello: Option<Vec<u8>>,
+
+    /// The negotiated cipher suite's standard (RFC) name
+    pub cipher: Option<&'static str>,
+
+    /// The negotiated key exchange group, by its TLS id
+    pub group: Option<u16>,
+
+    /// Whether the server answered the first ClientHello with a HelloRetryRequest
+    pub hello_retry_request: bool,
+
+    /// Whether the handshake resumed a session
+    pub resumed: bool,
+
+    /// The transport parameters the peer sent, as it encoded them
+    pub peer_transport_parameters: Option<Vec<u8>>,
 }
 
 pub mod helpers {
